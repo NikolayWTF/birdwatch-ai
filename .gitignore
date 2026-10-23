@@ -20,6 +20,13 @@ recordings/*
 dataset/raw/*
 !dataset/raw/.gitkeep
 
+dataset/detections/*
+!dataset/detections/.gitkeep
+
+# ML models
+*.pt
+*.onnx
+
 # IDE
 .vscode/
 .idea/
