@@ -16,6 +16,10 @@ __pycache__/
 recordings/*
 !recordings/.gitkeep
 
+# Camera snapshots
+dataset/raw/*
+!dataset/raw/.gitkeep
+
 # IDE
 .vscode/
 .idea/
