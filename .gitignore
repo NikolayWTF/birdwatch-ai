@@ -23,6 +23,12 @@ dataset/raw/*
 dataset/detections/*
 !dataset/detections/.gitkeep
 
+recordings/birds/*
+!recordings/birds/.gitkeep
+
+recordings/buffer/*
+!recordings/buffer/.gitkeep
+
 # ML models
 *.pt
 *.onnx
@@ -34,3 +40,7 @@ dataset/detections/*
 # OS
 .DS_Store
 Thumbs.db
+
+# BirdWatch recordings
+recordings/birds/*
+recordings/buffer/*
