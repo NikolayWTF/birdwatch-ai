@@ -9,6 +9,8 @@ from urllib.parse import quote
 from dotenv import load_dotenv
 from ultralytics import YOLO
 
+from event_log import init_db, create_event, update_event
+from telegram_notify import TelegramNotifier
 from rtsp_camera import RTSPCamera
 
 
@@ -94,7 +96,7 @@ def segment_time(path):
 def get_completed_segments():
     files = sorted(BUFFER_DIR.glob("*.ts"))
 
-    # Последний сегмент может ещё записываться.
+    # Последний сегмент FFmpeg может ещё записывать.
     return files[:-1]
 
 
@@ -149,7 +151,7 @@ def save_recording(event_time):
 
     if not segments:
         print("[Recording] Нет видеофрагментов")
-        return
+        return None
 
     timestamp = event_time.strftime("%Y-%m-%d_%H-%M-%S")
     output_file = RECORDINGS_DIR / f"bird_{timestamp}.mp4"
@@ -191,22 +193,38 @@ def save_recording(event_time):
             timeout=60,
         )
 
+        if not output_file.exists():
+            print("[Recording] Выходной файл не создан")
+            return None
+
+        if output_file.stat().st_size == 0:
+            print("[Recording] Выходной файл пустой")
+            output_file.unlink(missing_ok=True)
+            return None
+
         print(
             f"[Recording] Видео сохранено: {output_file}"
         )
 
+        return output_file
+
     except (
         subprocess.CalledProcessError,
         subprocess.TimeoutExpired,
+        OSError,
     ) as error:
         print(f"[Recording] Ошибка: {error}")
         output_file.unlink(missing_ok=True)
+        return None
 
     finally:
         playlist.unlink(missing_ok=True)
 
 
 def main():
+    init_db()
+    telegram = TelegramNotifier().start()
+
     print("[YOLO] Загрузка модели...")
 
     model = YOLO(MODEL_PATH)
@@ -217,7 +235,7 @@ def main():
         if name == "bird"
     )
 
-    # Удаляем временные сегменты от прошлых запусков.
+    # Удаляем временные сегменты предыдущих запусков.
     for path in BUFFER_DIR.glob("*.ts"):
         path.unlink()
 
@@ -243,13 +261,16 @@ def main():
         consecutive_detections = 0
 
         recording_event = None
+        recording_event_id = None
+        recording_confidence = 0.0
+
         ready_for_new_event = True
         last_detection_time = None
 
         while True:
             now = datetime.now()
 
-            # Проверяем, продолжает ли FFmpeg получать видео.
+            # Проверяем состояние видеобуфера.
             if not buffer_is_healthy(
                 ffmpeg_process,
                 ffmpeg_started_at,
@@ -273,17 +294,40 @@ def main():
                         "[FFmpeg] Повторное подключение запущено"
                     )
 
-            # Проверяем завершение текущего события.
+            # Завершаем текущую запись.
             if recording_event is not None:
                 elapsed = (
                     now - recording_event
                 ).total_seconds()
 
                 if elapsed >= POST_RECORD_SECONDS + 5:
-                    save_recording(recording_event)
-                    recording_event = None
+                    video_path = save_recording(recording_event)
 
-            # Удаляем старые сегменты.
+                    if video_path is not None:
+                        update_event(
+                            recording_event_id,
+                            status="saved",
+                            video_path=video_path,
+                        )
+
+                        telegram.send_video(recording_event_id)
+
+                    else:
+                        update_event(
+                            recording_event_id,
+                            status="failed",
+                        )
+
+                        telegram.send_message(
+                            "⚠️ Не удалось сохранить видео "
+                            f"события #{recording_event_id}"
+                        )
+
+                    recording_event = None
+                    recording_event_id = None
+                    recording_confidence = 0.0
+
+            # Очищаем старые временные сегменты.
             keep_after = now - timedelta(
                 seconds=BUFFER_RETENTION
             )
@@ -304,6 +348,7 @@ def main():
 
             last_frame_id = frame_id
 
+            # Обнаруживаем птиц.
             results = model.predict(
                 source=frame,
                 conf=CONFIDENCE,
@@ -316,13 +361,19 @@ def main():
             bird_found = len(results[0].boxes) > 0
             detection_time = datetime.now()
 
+            confidence = (
+                float(results[0].boxes.conf.max().item())
+                if bird_found else 0.0
+            )
+
             if bird_found:
                 consecutive_detections += 1
                 last_detection_time = detection_time
             else:
                 consecutive_detections = 0
 
-            # Разрешаем новое событие после отсутствия птиц.
+            # Новое событие разрешено, если птицы
+            # отсутствовали в кадре минимум 10 секунд.
             if (
                 last_detection_time is not None
                 and (
@@ -331,7 +382,6 @@ def main():
             ):
                 ready_for_new_event = True
 
-            # Проверяем, что буфер уже содержит видео.
             buffer_ready = bool(get_completed_segments())
 
             # Запускаем новое событие.
@@ -342,11 +392,26 @@ def main():
                 and consecutive_detections >= CONFIRM_FRAMES
             ):
                 recording_event = detection_time
+                recording_confidence = confidence
                 ready_for_new_event = False
+
+                recording_event_id = create_event(
+                    detected_at=detection_time,
+                    confidence=recording_confidence,
+                )
 
                 print(
                     f"[{detection_time:%H:%M:%S}] "
-                    "Обнаружена птица! Записываем видео..."
+                    f"Обнаружена птица! "
+                    f"Событие #{recording_event_id}"
+                )
+
+                telegram.send_message(
+                    "🐦 Обнаружена птица!\n\n"
+                    f"Событие: #{recording_event_id}\n"
+                    f"Время: {detection_time:%H:%M:%S}\n"
+                    f"Уверенность YOLO: {confidence:.0%}\n\n"
+                    "🎥 Началась запись видео."
                 )
 
             time.sleep(0.01)
@@ -358,6 +423,7 @@ def main():
             camera.stop()
 
         stop_buffer(ffmpeg_process)
+        telegram.stop()
 
         print("[BirdWatch] Работа завершена")
 
