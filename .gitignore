@@ -29,6 +29,7 @@ recordings/birds/*
 recordings/buffer/*
 !recordings/buffer/.gitkeep
 
+data/events.db
 # ML models
 *.pt
 *.onnx
