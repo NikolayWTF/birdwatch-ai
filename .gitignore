@@ -29,7 +29,11 @@ recordings/birds/*
 recordings/buffer/*
 !recordings/buffer/.gitkeep
 
-data/events.db
+# SQLite database
+data/*.db
+data/*.db-shm
+data/*.db-wal
+
 # ML models
 *.pt
 *.onnx
