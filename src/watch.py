@@ -13,6 +13,8 @@ from event_log import init_db, create_event, update_event
 from telegram_notify import TelegramNotifier
 from rtsp_camera import RTSPCamera
 
+from uptime_monitor import UptimeMonitor
+
 
 load_dotenv()
 
@@ -246,6 +248,7 @@ def main():
     last_ffmpeg_restart = 0.0
 
     camera = None
+    uptime_monitor = None
 
     try:
         camera = RTSPCamera(
@@ -253,6 +256,8 @@ def main():
             reconnect_delay=5,
             timeout_ms=5000,
         ).start()
+
+        uptime_monitor = UptimeMonitor(camera).start()
 
         print("[BirdWatch] Наблюдение запущено!")
         print("[BirdWatch] Ctrl+C для остановки")
@@ -421,6 +426,9 @@ def main():
 
         if camera is not None:
             camera.stop()
+
+        if uptime_monitor is not None:
+            uptime_monitor.stop()
 
         stop_buffer(ffmpeg_process)
         telegram.stop()
