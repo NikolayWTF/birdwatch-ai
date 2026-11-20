@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from event_log import DB_PATH, get_delivery_stats, init_db
 from uptime_monitor import get_uptime_stats
 from channel_publish import init_publications, publish
+from video_likes import init_likes, like_count, has_liked, toggle_like
 
 
 load_dotenv()
@@ -84,6 +85,43 @@ def get_rows(query, params=()):
     with sqlite3.connect(DB_PATH, timeout=10) as connection:
         connection.row_factory = sqlite3.Row
         return connection.execute(query, params).fetchall()
+
+
+def video_like_keyboard(event_id, user_id):
+    count = like_count(event_id)
+    liked = has_liked(event_id, user_id)
+
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": (
+                        f"❤️ Нравится · {count}"
+                        if liked
+                        else f"🤍 Нравится · {count}"
+                    ),
+                    "callback_data": f"like:{event_id}",
+                }
+            ]
+        ]
+    }
+
+
+def attach_video_like_button(chat_id, event_id, message_id):
+    keyboard = video_like_keyboard(event_id, int(chat_id))
+
+    api_request(
+        "editMessageReplyMarkup",
+        data={
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reply_markup": json.dumps(
+                keyboard,
+                ensure_ascii=False,
+            ),
+        },
+    )
+
 
 
 def offer_publication(chat_id, event_id):
@@ -504,7 +542,8 @@ def send_last_video(chat_id, event_id=None):
         and event["telegram_message_id"]
     ):
         try:
-            api_request(
+
+            copied = api_request(
                 "copyMessage",
                 data={
                     "chat_id": chat_id,
@@ -512,7 +551,18 @@ def send_last_video(chat_id, event_id=None):
                     "message_id": event["telegram_message_id"],
                 },
             )
+
+            try:
+                attach_video_like_button(
+                    chat_id,
+                    event["id"],
+                    copied["message_id"],
+                )
+            except (requests.RequestException, RuntimeError) as error:
+                print(f"[Bot] Не удалось добавить кнопку: {type(error).__name__}")
+
             return
+
         except (requests.RequestException, RuntimeError):
             print("[Bot] Не удалось скопировать сообщение")
 
@@ -528,7 +578,7 @@ def send_last_video(chat_id, event_id=None):
         return
 
     with path.open("rb") as video:
-        api_request(
+        sent = api_request(
             "sendVideo",
             data={
                 "chat_id": chat_id,
@@ -540,6 +590,16 @@ def send_last_video(chat_id, event_id=None):
             },
             timeout=150,
         )
+
+    try:
+        attach_video_like_button(
+            chat_id,
+            event["id"],
+            sent["message_id"],
+        )
+    except (requests.RequestException, RuntimeError) as error:
+        print(f"[Bot] Не удалось добавить кнопку: {type(error).__name__}")
+
 
 
 def show_menu(chat_id):
@@ -708,6 +768,7 @@ COMMANDS = {
 
 def main():
     init_db()
+    init_likes()
     init_publications()
 
     print("[Bot] Telegram-меню запущено")
@@ -738,6 +799,74 @@ def main():
                     chat = callback.get("message", {}).get("chat", {})
                     chat_id = chat.get("id")
                     action = callback.get("data", "")
+
+                    if action.startswith("like:"):
+                        callback_id = callback["id"]
+                        user_id = callback["from"]["id"]
+
+                        if (
+                            chat.get("type") != "private"
+                            or chat_id != user_id
+                        ):
+                            api_request(
+                                "answerCallbackQuery",
+                                data={
+                                    "callback_query_id": callback_id,
+                                    "text": "Лайки доступны в личном чате.",
+                                },
+                            )
+                            continue
+
+                        try:
+                            event_id = int(action.split(":", 1)[1])
+
+                            liked, count = toggle_like(
+                                event_id,
+                                user_id,
+                            )
+
+                            keyboard = video_like_keyboard(
+                                event_id,
+                                user_id,
+                            )
+
+                            api_request(
+                                "editMessageReplyMarkup",
+                                data={
+                                    "chat_id": chat_id,
+                                    "message_id": callback["message"]["message_id"],
+                                    "reply_markup": json.dumps(
+                                        keyboard,
+                                        ensure_ascii=False,
+                                    ),
+                                },
+                            )
+
+                            answer = (
+                                "❤️ Лайк добавлен!"
+                                if liked
+                                else "Лайк убран"
+                            )
+
+                            api_request(
+                                "answerCallbackQuery",
+                                data={
+                                    "callback_query_id": callback_id,
+                                    "text": answer,
+                                },
+                            )
+
+                        except (ValueError, sqlite3.Error):
+                            api_request(
+                                "answerCallbackQuery",
+                                data={
+                                    "callback_query_id": callback_id,
+                                    "text": "Не удалось сохранить лайк.",
+                                    "show_alert": "true",
+                                },
+                            )
+
+                        continue
 
                     if (
                         action.startswith("videos:")
