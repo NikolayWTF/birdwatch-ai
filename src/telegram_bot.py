@@ -3,6 +3,7 @@ import json
 import os
 import sqlite3
 import time
+import threading
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from dotenv import load_dotenv
 
 from event_log import DB_PATH, get_delivery_stats, init_db
 from uptime_monitor import get_uptime_stats
+from channel_publish import init_publications, publish
 
 
 load_dotenv()
@@ -82,6 +84,144 @@ def get_rows(query, params=()):
     with sqlite3.connect(DB_PATH, timeout=10) as connection:
         connection.row_factory = sqlite3.Row
         return connection.execute(query, params).fetchall()
+
+
+def offer_publication(chat_id, event_id):
+    """Показывает кнопку публикации только владельцу."""
+    if str(chat_id) != OWNER_ID:
+        return
+
+    rows = get_rows(
+        """
+        SELECT e.id, COALESCE(
+            p.status, 'not_published'
+        ) AS publication_status
+        FROM events e
+        LEFT JOIN channel_publications p
+            ON p.event_id = e.id
+        WHERE e.id = ?
+          AND e.status = 'saved'
+        """,
+        (event_id,),
+    )
+
+    if not rows:
+        return
+
+    status = rows[0]["publication_status"]
+
+    if status == "published":
+        send_message(
+            chat_id,
+            f"✅ Событие #{event_id} уже опубликовано в канале."
+        )
+        return
+
+    if status == "publishing":
+        send_message(
+            chat_id,
+            f"⏳ Событие #{event_id} уже имеет статус publishing.\n"
+            "Проверь канал перед повторной попыткой."
+        )
+        return
+
+    keyboard = {
+        "inline_keyboard": [[
+            {
+                "text": "📢 Опубликовать в канале",
+                "callback_data": f"publish_ask:{event_id}",
+            }
+        ]]
+    }
+
+    api_request(
+        "sendMessage",
+        data={
+            "chat_id": chat_id,
+            "text": (
+                f"🐦 Событие #{event_id}\n\n"
+                "Это видео ещё не опубликовано в канале."
+            ),
+            "reply_markup": json.dumps(
+                keyboard, ensure_ascii=False
+            ),
+        },
+    )
+
+
+def confirm_publication(chat_id, event_id):
+    """Запрашивает подтверждение публикации."""
+    if str(chat_id) != OWNER_ID:
+        return
+
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "✅ Опубликовать",
+                    "callback_data": f"publish_go:{event_id}",
+                },
+                {
+                    "text": "❌ Отмена",
+                    "callback_data": "publish_cancel",
+                },
+            ]
+        ]
+    }
+
+    api_request(
+        "sendMessage",
+        data={
+            "chat_id": chat_id,
+            "text": (
+                f"📢 Публикация события #{event_id}\n\n"
+                "Видео появится в публичном канале.\n"
+                "Подтвердить?"
+            ),
+            "reply_markup": json.dumps(
+                keyboard, ensure_ascii=False
+            ),
+        },
+    )
+
+
+def publication_worker(chat_id, event_id):
+    """Выполняет отправку, не блокируя Telegram-бота."""
+    try:
+        publish(event_id)
+
+        message = (
+            f"✅ Событие #{event_id} опубликовано в канале!"
+        )
+
+    except (ValueError, RuntimeError, OSError, sqlite3.Error) as error:
+        print(
+            f"[Publish] Событие #{event_id}: "
+            f"{type(error).__name__}"
+        )
+
+        message = (
+            f"⚠️ Не удалось завершить публикацию #{event_id}.\n"
+            "Проверь канал и статус публикации в SQLite.\n"
+            "Не запускай повторную отправку вслепую."
+        )
+
+    try:
+        # Отдельный HTTP-запрос: не используем session
+        # основного polling-потока.
+        response = requests.post(
+            f"{API_URL}/sendMessage",
+            data={
+                "chat_id": chat_id,
+                "text": message,
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+
+    except requests.RequestException:
+        print("[Publish] Не удалось уведомить администратора")
+
 
 
 PAGE_SIZE = 5
@@ -414,11 +554,54 @@ def show_menu(chat_id):
 
 def handle_action(chat_id, action):
 
-    
-    if action.startswith("videos:"):
-        page = int(action.split(":")[1])
-        show_video_archive(chat_id, page)
+
+    if action.startswith("publish_ask:"):
+        if str(chat_id) != OWNER_ID:
+            return
+
+        event_id = int(action.split(":")[1])
+        confirm_publication(chat_id, event_id)
         return
+
+    if action.startswith("publish_go:"):
+        if str(chat_id) != OWNER_ID:
+            return
+
+        event_id = int(action.split(":")[1])
+
+        send_message(
+            chat_id,
+            f"⏳ Запущена публикация события #{event_id}."
+        )
+
+        threading.Thread(
+            target=publication_worker,
+            args=(chat_id, event_id),
+            daemon=True,
+        ).start()
+        return
+
+    if action == "publish_cancel":
+        if str(chat_id) == OWNER_ID:
+            send_message(chat_id, "Публикация отменена.")
+        return
+
+
+
+    if action.startswith("video:"):
+        event_id = int(action.split(":")[1])
+
+        send_last_video(
+            chat_id,
+            event_id=event_id,
+        )
+
+        # Публикацию предлагаем только администратору.
+        if str(chat_id) == OWNER_ID:
+            offer_publication(chat_id, event_id)
+
+        return
+
 
     if action.startswith("video:"):
         event_id = int(action.split(":")[1])
@@ -525,6 +708,7 @@ COMMANDS = {
 
 def main():
     init_db()
+    init_publications()
 
     print("[Bot] Telegram-меню запущено")
     print("[Bot] Ctrl+C для остановки")
@@ -602,8 +786,22 @@ def main():
                 # Защита от слишком частых запросов.
                 now = time.monotonic()
 
-                if now - last_action.get(chat_id, 0) < 3:
+
+                is_publish_action = (
+                    action.startswith("publish_ask:")
+                    or action.startswith("publish_go:")
+                    or action == "publish_cancel"
+                )
+
+                if (
+                    not is_publish_action
+                    and now - last_action.get(chat_id, 0) < 3
+                ):
                     continue
+
+                if not is_publish_action:
+                    last_action[chat_id] = now
+
 
                 last_action[chat_id] = now
 
